@@ -65,7 +65,6 @@ Question:
                 "source": result.metadata.get("source"),
                 "title": result.metadata.get("title"),
                 "page": int(result.metadata.get("page", 0)) + 1,
-                "total_pages": result.metadata.get("total_pages"),
             }
             for result in results
         ]

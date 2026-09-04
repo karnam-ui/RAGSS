@@ -98,6 +98,8 @@ class Retriever:
             reverse=True,
         )
 
+        print(list(rerank_scores))
+
         parent_documents = []
         seen_parent_ids = set()
         for _, child in reranked_children:

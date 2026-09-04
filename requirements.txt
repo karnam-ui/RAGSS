@@ -1,0 +1,11 @@
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+pymupdf
+langchain-huggingface
+chromadb
+sentence-transformers
+rank-bm25
+transformers
+torch

@@ -11,7 +11,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 class Embed:
 
     def __init__(self, file_path=None):
-        self.file_path = file_path or str(Path.home() / "Downloads" / "Morphex.pdf")
+        self.file_path = file_path or str(Path.home() / "Downloads" / "OS All Units Notes.pdf")
         self.embedding_model = HuggingFaceEmbeddings(
             model_name="BAAI/bge-small-en-v1.5"
         )

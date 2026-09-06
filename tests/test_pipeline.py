@@ -10,7 +10,7 @@ from retrieval.pipeline import BasicRetriever
 from retrieval.retriver import Retriever
 
 answerer = BasicRetriever(Retriever())
-res = answerer.generate("What is the project abt and who are the teammembers?")
+res = answerer.generate("What is syllabus in the unit 2?")
 print("Answer:\n", res["answer"])
 print("\nCitations:")
 for citation in res["citations"]:

@@ -1,4 +1,5 @@
 import os
+import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -12,7 +13,7 @@ model_name = "Qwen/Qwen2.5-1.5B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(model_name)
 generation_config = GenerationConfig(
-    max_new_tokens=200,
+    max_new_tokens=512,
     do_sample=True,
     temperature=0.7,
 )

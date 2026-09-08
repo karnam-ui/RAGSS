@@ -9,9 +9,22 @@ if str(PROJECT_ROOT) not in sys.path:
 from ingestion.chunking import PDFIngestor
 
 ingestor = PDFIngestor()
-parents, children = ingestor.ingest("/Users/suhaas/Downloads/Morphex.pdf")
-for chunk in children:
-   print("-----------------\n")
-   print(chunk.page_content)
-   print(chunk.metadata['total_pages'])
-   print("\n")
+sample_dir = PROJECT_ROOT / "tests" / "sample_papers"
+sample_files = sorted(list(sample_dir.glob("*.pdf")))
+if sample_files:
+    test_paths = [str(f) for f in sample_files]
+else:
+    test_paths = ["/Users/suhaas/Downloads/Morphex.pdf"]
+
+parents, children = ingestor.ingest(test_paths)
+print(f"Total parents: {len(parents)}, Total children: {len(children)}")
+for chunk in children[:5]:
+    print("-----------------")
+    print("Content:", chunk.page_content[:80], "...")
+    print("Metadata:", {
+        "document_id": chunk.metadata.get("document_id"),
+        "document_name": chunk.metadata.get("document_name"),
+        "page": chunk.metadata.get("page"),
+        "chunk_id": chunk.metadata.get("chunk_id"),
+        "parent_id": chunk.metadata.get("parent_id"),
+    })

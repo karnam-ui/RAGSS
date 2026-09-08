@@ -62,6 +62,8 @@ Question:
 
         citations = [
             {
+                "document_id": result.metadata.get("document_id"),
+                "document_name": result.metadata.get("document_name"),
                 "source": result.metadata.get("source"),
                 "title": result.metadata.get("title"),
                 "page": int(result.metadata.get("page", 0)) + 1,

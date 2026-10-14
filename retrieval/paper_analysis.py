@@ -70,7 +70,7 @@ class PaperAnalyzer:
 
     def _ensure_retriever(self, file_paths: Optional[Union[str, List[str]]] = None) -> Retriever:
         if self.retriever is None:
-            self.retriever = Retriever(file_paths=file_paths)
+            self.retriever = Retriever(file_paths=file_paths, rebuild_index=bool(file_paths))
         return self.retriever
 
     def analyze_paper(
@@ -211,3 +211,35 @@ def analyze_papers(
 ) -> List[PaperAnalysis]:
     analyzer = PaperAnalyzer(retriever=retriever, llm=llm)
     return analyzer.analyze_papers(file_paths=file_paths, k=k)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run single or multi-paper analysis on research papers.")
+    parser.add_argument("pdf_paths", nargs="+", help="Path(s) to the PDF paper(s) to analyze.")
+    parser.add_argument("--k", type=int, default=4, help="Number of evidence chunks to retrieve per paper.")
+    parser.add_argument("--db-dir", type=str, default=None, help="Chroma persistence directory.")
+    args = parser.parse_args()
+
+    paths = args.pdf_paths
+    print(f"Starting paper analysis on {len(paths)} paper(s):")
+    for p in paths:
+        print(f" - {p}")
+
+    analyses = analyze_papers(file_paths=paths, k=args.k)
+
+    for idx, analysis in enumerate(analyses, 1):
+        print(f"\n========================================================")
+        print(f"Paper Analysis [{idx}/{len(analyses)}]: {analysis.document_name}")
+        print(f"Document ID:      {analysis.document_id}")
+        print(f"Title:            {analysis.title}")
+        print(f"Research Problem: {analysis.research_problem}")
+        print(f"Methodology:      {analysis.methodology}")
+        print(f"Major Claims:     {analysis.major_claims}")
+        print(f"Evidence:         {analysis.evidence}")
+        print(f"Limitations:      {analysis.limitations}")
+        print(f"\nCitations ({len(analysis.citations)}):")
+        for cit in analysis.citations:
+            print(f"  - [{cit.get('document_name')}] Page {cit.get('page')}: {cit.get('source')}")
+        print(f"========================================================\n")

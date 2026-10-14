@@ -5,11 +5,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import pytest
 from retrieval.cross_paper_analysis import CrossPaperAnalysis, CrossPaperAnalyzer, analyze_cross_paper
 from retrieval.paper_analysis import PaperAnalysis, analyze_papers
 from retrieval.retriver import Retriever
 
 
+@pytest.mark.integration
 def test_cross_paper_pipeline():
     sample_dir = PROJECT_ROOT / "tests" / "sample_papers"
     sample_files = sorted(list(sample_dir.glob("*.pdf")))

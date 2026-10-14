@@ -5,11 +5,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import pytest
 from ingestion.chunking import PDFIngestor
 from ingestion.embeddingss import Embed
 from retrieval.retriver import Retriever
 
 
+@pytest.mark.integration
 def test_multi_document_pipeline():
     sample_dir = PROJECT_ROOT / "tests" / "sample_papers"
     sample_files = sorted(list(sample_dir.glob("*.pdf")))

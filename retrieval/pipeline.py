@@ -8,16 +8,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFacePipeline
 
-from retrieval.retrieve_llm_pipeline import retrieve_llm_pipeline
+from typing import Any, Optional
+from retrieval.retrieve_llm_pipeline import get_llm
 from retrieval.retriver import Retriever
 
-llm = HuggingFacePipeline(
-    pipeline=retrieve_llm_pipeline,
-)
 
 class BasicRetriever:
-    def __init__(self, retriever):
+    def __init__(self, retriever: Any, llm: Optional[Any] = None):
         self.retriever = retriever
+        self.llm = llm if llm is not None else get_llm()
 
         self.prompt = ChatPromptTemplate.from_template("""
 You are a Project Guide assistant.
@@ -44,7 +43,8 @@ Question:
 """)
 
         # prompt → LLM
-        self.chain = self.prompt | llm
+        self.chain = self.prompt | self.llm
+
 
     def generate(self, query):
         results = self.retriever.retrieve(query)

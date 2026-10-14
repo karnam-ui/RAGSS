@@ -27,28 +27,62 @@ class Retriever:
         cross_encoder_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
         collection_name="research_papers",
         rebuild_index=False,
+        embedder=None,
+        vector_store=None,
+        cross_encoder=None,
+        parents=None,
+        documents=None,
     ):
         target_paths = file_paths if file_paths is not None else file_path
-        self.embedder = Embed(target_paths)
-        self.parents, _ = self.embedder.Embedchunks()
+
+        if embedder is not None:
+            self.embedder = embedder
+        else:
+            self.embedder = Embed(target_paths)
+
+        if parents is not None:
+            self.parents = parents
+        else:
+            self.parents, _ = self.embedder.Embedchunks()
+
         self.parent_by_id = {
             document.metadata["parent_id"]: document
             for document in self.parents
+            if document.metadata.get("parent_id")
         }
+
         self.persist_directory = Path(persist_directory or PROJECT_ROOT / "chroma_db")
         self.collection_name = collection_name
-        self.vector_store = Chroma(
-            collection_name=self.collection_name,
-            persist_directory=str(self.persist_directory),
-            embedding_function=self.embedder.embedding_model,
-        )
 
-        if rebuild_index or self._needs_indexing():
-            self.index_documents()
+        if vector_store is not None:
+            self.vector_store = vector_store
+        else:
+            self.vector_store = Chroma(
+                collection_name=self.collection_name,
+                persist_directory=str(self.persist_directory),
+                embedding_function=getattr(self.embedder, "embedding_model", None),
+            )
 
-        self.documents = self._load_documents()
-        self.bm25 = BM25Okapi([self._tokenize(document.page_content) for document in self.documents])
-        self.cross_encoder = CrossEncoder(cross_encoder_model)
+            if rebuild_index or self._needs_indexing():
+                self.index_documents()
+
+        if documents is not None:
+            self.documents = documents
+        else:
+            self.documents = self._load_documents()
+
+        if self.documents:
+            self.bm25 = BM25Okapi([self._tokenize(document.page_content) for document in self.documents])
+        else:
+            self.bm25 = None
+
+        if cross_encoder is not None:
+            self.cross_encoder = None if cross_encoder is False else cross_encoder
+        elif cross_encoder_model:
+            self.cross_encoder = CrossEncoder(cross_encoder_model)
+        else:
+            self.cross_encoder = None
+
 
     def index_documents(self):
         _, children = self.embedder.Embedchunks()
@@ -110,26 +144,34 @@ class Retriever:
             search_kwargs["filter"] = {"document_id": document_id}
 
         semantic_documents = self.vector_store.similarity_search(query, k=candidate_k, **search_kwargs)
-
         if document_id:
-            matching_indexes = [
-                idx for idx, doc in enumerate(self.documents)
+            semantic_documents = [
+                doc for doc in semantic_documents
                 if doc.metadata.get("document_id") == document_id
             ]
-            if matching_indexes:
-                scores = self.bm25.get_scores(self._tokenize(query))
-                sorted_matching = sorted(
-                    matching_indexes, key=lambda idx: scores[idx], reverse=True
-                )
-                bm25_indexes = sorted_matching[:candidate_k]
+
+        bm25_indexes = []
+        if self.bm25 is not None and self.documents:
+            if document_id:
+                matching_indexes = [
+                    idx for idx, doc in enumerate(self.documents)
+                    if doc.metadata.get("document_id") == document_id
+                ]
+                if matching_indexes:
+                    scores = self.bm25.get_scores(self._tokenize(query))
+                    sorted_matching = sorted(
+                        matching_indexes, key=lambda idx: scores[idx], reverse=True
+                    )
+                    bm25_indexes = sorted_matching[:candidate_k]
             else:
-                bm25_indexes = []
-        else:
-            bm25_indexes = self.bm25.get_top_n(
-                self._tokenize(query), list(range(len(self.documents))), n=candidate_k
-            )
+                bm25_indexes = self.bm25.get_top_n(
+                    self._tokenize(query),
+                    list(range(len(self.documents))),
+                    n=candidate_k
+                )
 
         lexical_documents = [self.documents[index] for index in bm25_indexes]
+
 
         rrf_scores = {}
         document_by_key = {}
@@ -143,16 +185,21 @@ class Retriever:
             document_by_key[key]
             for key, _ in sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)
         ]
-        rerank_scores = self.cross_encoder.predict(
-            [(query, document.page_content) for document in fused_documents]
-        )
-        reranked_children = sorted(
-            zip(rerank_scores, fused_documents),
-            key=lambda item: item[0],
-            reverse=True,
-        )
+        if not fused_documents:
+            return []
 
-        print(list(rerank_scores))
+        if self.cross_encoder is not None:
+            rerank_scores = self.cross_encoder.predict(
+                [(query, document.page_content) for document in fused_documents]
+            )
+            reranked_children = sorted(
+                zip(rerank_scores, fused_documents),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+        else:
+            reranked_children = [(1.0, doc) for doc in fused_documents]
+
 
         parent_documents = []
         seen_parent_ids = set()
@@ -165,6 +212,9 @@ class Retriever:
             if parent is not None:
                 parent_documents.append(parent)
                 seen_parent_ids.add(parent_id)
+            else:
+                parent_documents.append(child)
+                seen_parent_ids.add(parent_id or child.metadata.get("chunk_id"))
 
             if len(parent_documents) == k:
                 break

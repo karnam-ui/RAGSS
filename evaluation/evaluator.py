@@ -4,7 +4,9 @@ Retrieval Evaluation Harness Engine.
 Responsible for:
 - Loading and validating retrieval datasets
 - Invoking retrievers (live or fixture) with latency tracking
-- Computing per-query and aggregate metrics
+- Extracting target IDs according to strict level contracts (chunk, parent, document)
+- Computing per-query and aggregate metrics (Recall, Precision, Hit, MRR)
+- Tracking unanswerable query retrieval false positives vs clean abstentions
 - Producing reproducible evaluation reports
 """
 
@@ -20,16 +22,23 @@ from evaluation.metrics import (
     QueryEvalResult,
     compute_hit_at_k,
     compute_mrr,
+    compute_precision_at_k,
     compute_recall_at_k,
 )
+
+VALID_TARGET_LEVELS = ("chunk", "parent", "document")
 
 
 class RetrievalEvaluator:
     def __init__(
         self,
         dataset_path: Union[str, Path],
-        target_id_level: str = "chunk",  # "chunk", "parent", or "document"
+        target_id_level: str = "parent",
     ):
+        if target_id_level not in VALID_TARGET_LEVELS:
+            raise ValueError(
+                f"Invalid target_id_level '{target_id_level}'. Must be one of {VALID_TARGET_LEVELS}."
+            )
         self.dataset_path = Path(dataset_path)
         self.target_id_level = target_id_level
         self.dataset: List[Dict[str, Any]] = self._load_dataset()
@@ -74,21 +83,32 @@ class RetrievalEvaluator:
                 )
 
     def extract_document_ids(self, docs: List[Document]) -> List[str]:
-        """Extracts identifier strings from retrieved Document list based on target_id_level."""
+        """
+        Extracts identifier strings from retrieved Document list strictly based on target_id_level.
+        
+        If a retrieved Document lacks an ID at the requested target_id_level, a distinct
+        placeholder is assigned so that:
+        1. The document's rank position in the retrieved list is preserved.
+        2. Downstream rank-based metrics (Precision@K, MRR) penalize the missing/invalid entity.
+        3. No cross-level ID pollution occurs (e.g., comparing parent_id to expected_chunk_ids).
+        """
         ids: List[str] = []
-        for doc in docs:
+        for idx, doc in enumerate(docs):
             meta = getattr(doc, "metadata", {}) or {}
+            val: Optional[str] = None
+
             if self.target_id_level == "chunk":
-                val = meta.get("chunk_id") or meta.get("parent_id") or meta.get("document_id")
+                val = meta.get("chunk_id")
             elif self.target_id_level == "parent":
-                val = meta.get("parent_id") or meta.get("document_id")
-            else:
-                val = meta.get("document_id")
+                val = meta.get("parent_id")
+            elif self.target_id_level == "document":
+                val = meta.get("document_id") or meta.get("source")
 
             if val:
                 ids.append(str(val))
             else:
-                ids.append(str(meta.get("source", "unknown")))
+                ids.append(f"__unidentified_{self.target_id_level}_{idx}__")
+
         return ids
 
     def evaluate(
@@ -108,7 +128,7 @@ class RetrievalEvaluator:
             question = record["question"]
             is_answerable = record["is_answerable"]
 
-            # Select target IDs corresponding to target_id_level
+            # Select ground-truth target IDs corresponding to target_id_level
             if self.target_id_level == "chunk":
                 expected_ids = record.get("expected_chunk_ids") or []
             elif self.target_id_level == "parent":
@@ -121,29 +141,33 @@ class RetrievalEvaluator:
             elapsed_ms = (time.perf_counter() - start_t) * 1000.0
 
             retrieved_ids = self.extract_document_ids(retrieved_docs)
+            is_empty = (len(retrieved_ids) == 0)
 
             if is_answerable:
                 r1 = compute_recall_at_k(retrieved_ids, expected_ids, k=1)
                 r3 = compute_recall_at_k(retrieved_ids, expected_ids, k=3)
                 r5 = compute_recall_at_k(retrieved_ids, expected_ids, k=5)
-                mrr_val = compute_mrr(retrieved_ids, expected_ids)
+                p1 = compute_precision_at_k(retrieved_ids, expected_ids, k=1)
+                p3 = compute_precision_at_k(retrieved_ids, expected_ids, k=3)
+                p5 = compute_precision_at_k(retrieved_ids, expected_ids, k=5)
                 h1 = compute_hit_at_k(retrieved_ids, expected_ids, k=1)
                 h3 = compute_hit_at_k(retrieved_ids, expected_ids, k=3)
                 h5 = compute_hit_at_k(retrieved_ids, expected_ids, k=5)
-                has_hit = bool(set(retrieved_ids).intersection(expected_ids))
+                mrr_val = compute_mrr(retrieved_ids, expected_ids, k=max_k)
+                has_hit = (h5 == 1.0)
+                is_fp = False
                 unanswerable_flagged = False
             else:
-                # Unanswerable query: not expected to match any target
-                r1 = 0.0
-                r3 = 0.0
-                r5 = 0.0
+                # Unanswerable query: no corpus document is relevant
+                r1 = r3 = r5 = 0.0
+                p1 = p3 = p5 = 0.0
+                h1 = h3 = h5 = 0.0
                 mrr_val = 0.0
-                h1 = 0.0
-                h3 = 0.0
-                h5 = 0.0
                 has_hit = False
-                # If retriever returned empty or ungrounded, unanswerable handled cleanly
-                unanswerable_flagged = True
+                # If retriever returned documents for an out-of-corpus query, it's a retrieval false positive
+                is_fp = not is_empty
+                # Clean abstention at retrieval stage: retriever returned 0 documents
+                unanswerable_flagged = is_empty
 
             result = QueryEvalResult(
                 query_id=query_id,
@@ -154,11 +178,16 @@ class RetrievalEvaluator:
                 recall_at_1=r1,
                 recall_at_3=r3,
                 recall_at_5=r5,
-                mrr=mrr_val,
+                precision_at_1=p1,
+                precision_at_3=p3,
+                precision_at_5=p5,
                 hit_at_1=h1,
                 hit_at_3=h3,
                 hit_at_5=h5,
+                mrr=mrr_val,
                 has_any_hit=has_hit,
+                empty_retrieval=is_empty,
+                is_false_positive=is_fp,
                 unanswerable_flagged=unanswerable_flagged,
                 latency_ms=elapsed_ms,
             )
@@ -172,10 +201,19 @@ class RetrievalEvaluator:
         mean_r1 = sum(r.recall_at_1 for r in answerable_results) / num_ans if num_ans else 0.0
         mean_r3 = sum(r.recall_at_3 for r in answerable_results) / num_ans if num_ans else 0.0
         mean_r5 = sum(r.recall_at_5 for r in answerable_results) / num_ans if num_ans else 0.0
+        mean_p1 = sum(r.precision_at_1 for r in answerable_results) / num_ans if num_ans else 0.0
+        mean_p3 = sum(r.precision_at_3 for r in answerable_results) / num_ans if num_ans else 0.0
+        mean_p5 = sum(r.precision_at_5 for r in answerable_results) / num_ans if num_ans else 0.0
+        mean_h1 = sum(r.hit_at_1 for r in answerable_results) / num_ans if num_ans else 0.0
+        mean_h3 = sum(r.hit_at_3 for r in answerable_results) / num_ans if num_ans else 0.0
+        mean_h5 = sum(r.hit_at_5 for r in answerable_results) / num_ans if num_ans else 0.0
         mean_mrr_val = sum(r.mrr for r in answerable_results) / num_ans if num_ans else 0.0
 
         zero_hits = [r.query_id for r in answerable_results if not r.has_any_hit]
-        unanswerable_handled = sum(1 for r in unanswerable_results if r.unanswerable_flagged)
+        unanswerable_empty = sum(1 for r in unanswerable_results if r.empty_retrieval)
+        unanswerable_fp = sum(1 for r in unanswerable_results if r.is_false_positive)
+        total_lat = sum(r.latency_ms for r in per_query_results)
+        mean_latency = total_lat / len(per_query_results) if per_query_results else 0.0
 
         return AggregatedMetrics(
             total_queries=len(per_query_results),
@@ -184,9 +222,18 @@ class RetrievalEvaluator:
             mean_recall_at_1=mean_r1,
             mean_recall_at_3=mean_r3,
             mean_recall_at_5=mean_r5,
+            mean_precision_at_1=mean_p1,
+            mean_precision_at_3=mean_p3,
+            mean_precision_at_5=mean_p5,
+            mean_hit_at_1=mean_h1,
+            mean_hit_at_3=mean_h3,
+            mean_hit_at_5=mean_h5,
             mean_mrr=mean_mrr_val,
             zero_hit_query_count=len(zero_hits),
             zero_hit_query_ids=zero_hits,
-            unanswerable_handled_count=unanswerable_handled,
+            unanswerable_empty_retrieval_count=unanswerable_empty,
+            unanswerable_false_positive_count=unanswerable_fp,
+            unanswerable_handled_count=unanswerable_empty,
+            mean_latency_ms=mean_latency,
             per_query_results=per_query_results,
         )

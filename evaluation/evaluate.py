@@ -57,7 +57,8 @@ def build_fixture_retriever():
         results: List[Document] = []
 
         # Hand-curated semantic lexical mapping reflecting controlled fixture expectations
-        if "transduction" in q_lower or "recurrence" in q_lower:
+        # Use specific phrase 'sequence transduction' to avoid accidental false hits on unanswerable queries
+        if "sequence transduction" in q_lower or "recurrence" in q_lower:
             results.append(fixture_chunks["doc_1_paper1_transformers_p0_c0"])
         if "scaled dot-product" in q_lower or ("mapping" in q_lower and "attention" in q_lower):
             results.append(fixture_chunks["doc_1_paper1_transformers_p1_c0"])
@@ -170,15 +171,22 @@ def main():
     print("PER-QUERY RESULTS")
     print("=" * 70)
     for res in metrics.per_query_results:
-        status_icon = "✓" if res.has_any_hit or (not res.is_answerable and res.unanswerable_flagged) else "✗"
         type_str = "Answerable" if res.is_answerable else "Unanswerable"
-        print(f"{status_icon} [{res.query_id}] ({type_str}) - {res.question[:55]}...")
         if res.is_answerable:
+            status_icon = "✓" if res.has_any_hit else "✗"
+            print(f"{status_icon} [{res.query_id}] ({type_str}) - {res.question[:55]}...")
             print(f"    Expected:  {res.expected_ids}")
             print(f"    Retrieved: {res.retrieved_ids}")
-            print(f"    R@1: {res.recall_at_1:.2f} | R@3: {res.recall_at_3:.2f} | R@5: {res.recall_at_5:.2f} | MRR: {res.mrr:.2f} | Latency: {res.latency_ms:.2f}ms")
+            print(f"    R@1: {res.recall_at_1:.2f} | R@3: {res.recall_at_3:.2f} | R@5: {res.recall_at_5:.2f} | P@5: {res.precision_at_5:.2f} | MRR: {res.mrr:.2f} | Latency: {res.latency_ms:.2f}ms")
         else:
-            print(f"    Out-of-corpus query | Retrieved {len(res.retrieved_ids)} chunk(s) | Handled cleanly: {res.unanswerable_flagged}")
+            if res.empty_retrieval:
+                status_icon = "✓"
+                print(f"{status_icon} [{res.query_id}] ({type_str}) - {res.question[:55]}...")
+                print("    Out-of-corpus query | Clean abstention (0 docs retrieved)")
+            else:
+                status_icon = "✗"
+                print(f"{status_icon} [{res.query_id}] ({type_str}) - {res.question[:55]}...")
+                print(f"    Out-of-corpus query | False positive retrieval ({len(res.retrieved_ids)} doc(s) retrieved: {res.retrieved_ids})")
         print("-" * 70)
 
     print("\n" + "=" * 70)
@@ -189,17 +197,9 @@ def main():
     if args.output_json:
         out_path = Path(args.output_json)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_payload = {
-            "mode": args.mode,
-            "target_id_level": args.level,
-            "total_queries": metrics.total_queries,
-            "mean_recall_at_1": metrics.mean_recall_at_1,
-            "mean_recall_at_3": metrics.mean_recall_at_3,
-            "mean_recall_at_5": metrics.mean_recall_at_5,
-            "mean_mrr": metrics.mean_mrr,
-            "zero_hit_query_count": metrics.zero_hit_query_count,
-            "results": [r.to_dict() for r in metrics.per_query_results],
-        }
+        summary_payload = metrics.to_dict()
+        summary_payload["mode"] = args.mode
+        summary_payload["target_id_level"] = args.level
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(summary_payload, f, indent=2)
         print(f"✓ Saved detailed results JSON to: {out_path}")

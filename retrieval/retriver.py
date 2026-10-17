@@ -1,6 +1,8 @@
 import sys
 import re
+import logging
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -16,6 +18,8 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
 from ingestion.embeddingss import Embed
+
+logger = logging.getLogger(__name__)
 
 
 class Retriever:
@@ -72,9 +76,12 @@ class Retriever:
             self.documents = self._load_documents()
 
         if self.documents:
-            self.bm25 = BM25Okapi([self._tokenize(document.page_content) for document in self.documents])
+            tokenized_corpus = [self._tokenize(document.page_content) for document in self.documents]
+            self.bm25 = BM25Okapi(tokenized_corpus)
+            self._doc_token_sets = [set(tokens) for tokens in tokenized_corpus]
         else:
             self.bm25 = None
+            self._doc_token_sets = []
 
         if cross_encoder is not None:
             self.cross_encoder = None if cross_encoder is False else cross_encoder
@@ -83,24 +90,32 @@ class Retriever:
         else:
             self.cross_encoder = None
 
-
     def index_documents(self):
+        if not hasattr(self.embedder, "Embedchunks"):
+            return
         _, children = self.embedder.Embedchunks()
         existing_ids = self.vector_store.get().get("ids", [])
         if existing_ids:
             self.vector_store.delete(ids=existing_ids)
-        self.vector_store = Chroma.from_documents(
-            documents=children,
-            embedding=self.embedder.embedding_model,
-            persist_directory=str(self.persist_directory),
-            collection_name=self.collection_name,
-        )
+        if children:
+            self.vector_store = Chroma.from_documents(
+                documents=children,
+                embedding=self.embedder.embedding_model,
+                persist_directory=str(self.persist_directory),
+                collection_name=self.collection_name,
+            )
 
     def rebuild_index(self):
         """Safely clears and re-indexes all documents into the shared Chroma collection."""
         self.index_documents()
         self.documents = self._load_documents()
-        self.bm25 = BM25Okapi([self._tokenize(document.page_content) for document in self.documents])
+        if self.documents:
+            tokenized_corpus = [self._tokenize(document.page_content) for document in self.documents]
+            self.bm25 = BM25Okapi(tokenized_corpus)
+            self._doc_token_sets = [set(tokens) for tokens in tokenized_corpus]
+        else:
+            self.bm25 = None
+            self._doc_token_sets = []
 
     def _needs_indexing(self):
         stored = self.vector_store.get(include=["metadatas"])
@@ -122,6 +137,8 @@ class Retriever:
 
     @staticmethod
     def _tokenize(text):
+        if not text:
+            return []
         return re.findall(r"\b\w+\b", text.lower())
 
     def get_indexed_papers(self):
@@ -138,86 +155,165 @@ class Retriever:
                 })
         return papers
 
-    def retrieve(self, query, k=4, candidate_k=8, document_id=None):
+    def retrieve(
+        self,
+        query: str,
+        k: int = 4,
+        candidate_k: Optional[int] = None,
+        document_id: Optional[str] = None,
+        rrf_k: int = 60,
+    ) -> List[Document]:
+        """
+        Executes hybrid retrieval (dense vector similarity + lexical BM25), reciprocal rank fusion (RRF),
+        optional cross-encoder reranking, and hierarchical parent-child expansion.
+
+        Guarantees:
+        - If query is empty, whitespace-only, or non-string: returns [] immediately.
+        - If k <= 0: returns [] immediately.
+        - candidate_k is clamped to max(candidate_k, k) so candidate pool is never smaller than requested k.
+        - If document_id is provided, both dense and lexical branches filter strictly, and parent expansion
+          preserves the filter invariant.
+        - BM25 candidates strictly require lexical term overlap with query tokens (no zero-overlap hallucinations).
+        - If cross-encoder fails during reranking, gracefully logs a warning and falls back to RRF rank order.
+        - Orphan chunks without resolvable parents fall back safely without blocking subsequent orphans.
+        """
+        # 1. Input validation & contract boundaries
+        if query is None or not isinstance(query, str) or not query.strip():
+            return []
+
+        if k is None:
+            k = 4
+        try:
+            k = int(k)
+        except (ValueError, TypeError):
+            return []
+        if k <= 0:
+            return []
+
+        if candidate_k is None or candidate_k <= 0:
+            candidate_k = max(8, k * 2)
+        else:
+            try:
+                candidate_k = int(candidate_k)
+            except (ValueError, TypeError):
+                candidate_k = max(8, k * 2)
+        candidate_k = max(candidate_k, k)
+
+        if document_id is not None:
+            document_id = str(document_id).strip() or None
+
+        # 2. Dense semantic retrieval
         search_kwargs = {}
         if document_id:
             search_kwargs["filter"] = {"document_id": document_id}
 
-        semantic_documents = self.vector_store.similarity_search(query, k=candidate_k, **search_kwargs)
+        try:
+            semantic_documents = self.vector_store.similarity_search(query, k=candidate_k, **search_kwargs)
+        except Exception as e:
+            logger.warning("Vector store similarity search failed (%s). Continuing with empty dense pool.", e)
+            semantic_documents = []
+
         if document_id:
             semantic_documents = [
                 doc for doc in semantic_documents
                 if doc.metadata.get("document_id") == document_id
             ]
 
+        # 3. Lexical BM25 retrieval (strictly requiring lexical term overlap)
         bm25_indexes = []
         if self.bm25 is not None and self.documents:
-            if document_id:
-                matching_indexes = [
-                    idx for idx, doc in enumerate(self.documents)
-                    if doc.metadata.get("document_id") == document_id
-                ]
-                if matching_indexes:
-                    scores = self.bm25.get_scores(self._tokenize(query))
-                    sorted_matching = sorted(
-                        matching_indexes, key=lambda idx: scores[idx], reverse=True
+            tokenized_query = self._tokenize(query)
+            query_token_set = set(tokenized_query)
+            if query_token_set:
+                scores = self.bm25.get_scores(tokenized_query)
+                if document_id:
+                    candidate_indexes = [
+                        idx for idx, doc in enumerate(self.documents)
+                        if doc.metadata.get("document_id") == document_id
+                        and bool(query_token_set.intersection(self._doc_token_sets[idx]))
+                    ]
+                else:
+                    candidate_indexes = [
+                        idx for idx in range(len(self.documents))
+                        if bool(query_token_set.intersection(self._doc_token_sets[idx]))
+                    ]
+
+                if candidate_indexes:
+                    sorted_indexes = sorted(
+                        candidate_indexes, key=lambda idx: scores[idx], reverse=True
                     )
-                    bm25_indexes = sorted_matching[:candidate_k]
-            else:
-                bm25_indexes = self.bm25.get_top_n(
-                    self._tokenize(query),
-                    list(range(len(self.documents))),
-                    n=candidate_k
-                )
+                    bm25_indexes = sorted_indexes[:candidate_k]
 
         lexical_documents = [self.documents[index] for index in bm25_indexes]
 
-
-        rrf_scores = {}
-        document_by_key = {}
+        # 4. Reciprocal Rank Fusion (RRF)
+        rrf_scores: Dict[Any, float] = {}
+        document_by_key: Dict[Any, Document] = {}
         for ranked_documents in (semantic_documents, lexical_documents):
             for rank, document in enumerate(ranked_documents, start=1):
                 key = self._document_key(document)
-                document_by_key[key] = document
-                rrf_scores[key] = rrf_scores.get(key, 0.0) + 1 / (60 + rank)
+                if key not in document_by_key:
+                    document_by_key[key] = document
+                rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (float(rrf_k) + float(rank))
 
+        # Stable sort descending by RRF score (Timsort preserves order of appearance for ties)
         fused_documents = [
             document_by_key[key]
-            for key, _ in sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)
+            for key, _ in sorted(
+                rrf_scores.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
         ]
         if not fused_documents:
             return []
 
+        # 5. Optional Cross-Encoder reranking with fault tolerance
         if self.cross_encoder is not None:
-            rerank_scores = self.cross_encoder.predict(
-                [(query, document.page_content) for document in fused_documents]
-            )
-            reranked_children = sorted(
-                zip(rerank_scores, fused_documents),
-                key=lambda item: item[0],
-                reverse=True,
-            )
+            try:
+                rerank_scores = self.cross_encoder.predict(
+                    [(query, document.page_content) for document in fused_documents]
+                )
+                reranked_children = sorted(
+                    zip(rerank_scores, fused_documents),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+            except Exception as e:
+                logger.warning("Cross-encoder reranking failed (%s). Falling back to RRF rank order.", e)
+                reranked_children = [(1.0, doc) for doc in fused_documents]
         else:
             reranked_children = [(1.0, doc) for doc in fused_documents]
 
+        # 6. Hierarchical parent expansion with strict deduplication & filter validation
+        parent_documents: List[Document] = []
+        seen_parent_ids: Set[str] = set()
+        seen_chunk_keys: Set[Any] = set()
 
-        parent_documents = []
-        seen_parent_ids = set()
         for _, child in reranked_children:
-            parent_id = child.metadata.get("parent_id")
-            if parent_id in seen_parent_ids:
-                continue
-
-            parent = self.parent_by_id.get(parent_id)
-            if parent is not None:
-                parent_documents.append(parent)
-                seen_parent_ids.add(parent_id)
-            else:
-                parent_documents.append(child)
-                seen_parent_ids.add(parent_id or child.metadata.get("chunk_id"))
-
-            if len(parent_documents) == k:
+            if len(parent_documents) >= k:
                 break
+
+            parent_id = child.metadata.get("parent_id")
+            parent = self.parent_by_id.get(parent_id) if parent_id else None
+
+            if parent is not None:
+                # If document_id filter is active, enforce on parent document
+                if document_id and parent.metadata.get("document_id") != document_id:
+                    continue
+                if parent_id in seen_parent_ids:
+                    continue
+                seen_parent_ids.add(parent_id)
+                parent_documents.append(parent)
+            else:
+                # Fallback: orphan chunk without resolvable parent
+                if document_id and child.metadata.get("document_id") != document_id:
+                    continue
+                chunk_key = self._document_key(child)
+                if chunk_key in seen_chunk_keys:
+                    continue
+                seen_chunk_keys.add(chunk_key)
+                parent_documents.append(child)
 
         return parent_documents
 

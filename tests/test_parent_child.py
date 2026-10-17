@@ -73,3 +73,63 @@ def test_multiple_children_from_same_parent_deduplicated():
     # The parent should only appear ONCE in returned results, not twice!
     assert len(results) == 1
     assert results[0].metadata["parent_id"] == "p1"
+
+
+def test_multiple_distinct_orphan_chunks_not_dropped():
+    # Two orphan chunks with no parent_id
+    child1 = Document(page_content="Orphan 1", metadata={"chunk_id": "c1", "document_id": "d1"})
+    child2 = Document(page_content="Orphan 2", metadata={"chunk_id": "c2", "document_id": "d1"})
+
+    retriever = Retriever(
+        embedder=object(),
+        vector_store=MockVectorStore([child1, child2]),
+        cross_encoder=False,
+        parents=[],
+        documents=[child1, child2],
+    )
+
+    results = retriever.retrieve("query", k=2)
+    # Both distinct orphan chunks must be returned; none should be dropped
+    assert len(results) == 2
+    assert results[0].metadata["chunk_id"] == "c1"
+    assert results[1].metadata["chunk_id"] == "c2"
+
+
+def test_parent_expansion_enforces_document_id_filter():
+    # Child from doc1 points to parent that has mismatched document_id 'doc2'
+    child1 = Document(page_content="Child 1", metadata={"chunk_id": "c1", "parent_id": "p1", "document_id": "doc1"})
+    corrupt_parent = Document(page_content="Parent Corrupt", metadata={"parent_id": "p1", "document_id": "doc2"})
+
+    retriever = Retriever(
+        embedder=object(),
+        vector_store=MockVectorStore([child1]),
+        cross_encoder=False,
+        parents=[corrupt_parent],
+        documents=[child1],
+    )
+
+    # When filtering for doc1, the corrupt parent with doc2 must be rejected
+    results = retriever.retrieve("query", k=1, document_id="doc1")
+    assert len(results) == 0
+
+
+def test_parent_expansion_respects_exact_k():
+    children = [
+        Document(page_content=f"Child {i}", metadata={"chunk_id": f"c{i}", "parent_id": f"p{i}", "document_id": f"d{i}"})
+        for i in range(10)
+    ]
+    parents = [
+        Document(page_content=f"Parent {i}", metadata={"parent_id": f"p{i}", "document_id": f"d{i}"})
+        for i in range(10)
+    ]
+
+    retriever = Retriever(
+        embedder=object(),
+        vector_store=MockVectorStore(children),
+        cross_encoder=False,
+        parents=parents,
+        documents=children,
+    )
+
+    results = retriever.retrieve("query", k=3)
+    assert len(results) == 3

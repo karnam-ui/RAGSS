@@ -9,9 +9,10 @@ This directory contains the reproducible retrieval evaluation harness, versioned
 ```
 evaluation/
 ├── retrieval_dataset.jsonl   # Versioned ground-truth evaluation dataset (12 queries)
-├── metrics.py                # Standalone IR metrics: Recall@K, MRR, Precision@K, Hit@K
+├── metrics.py                # Standalone IR metrics: Recall@K, Precision@K, Hit@K, MRR@K
 ├── evaluator.py              # Core harness engine: dataset loading, execution, report aggregation
 ├── evaluate.py               # Standalone CLI runner (fixture & live modes)
+├── benchmark_results.json    # Standardized benchmark evaluation outputs
 └── README.md                 # Methodology, metric definitions, and command reference
 ```
 
@@ -42,27 +43,64 @@ The dataset is stored in standard JSONL format. Each record contains:
 
 ---
 
-## 3. Metric Definitions
+## 3. Evaluation Contracts & Metric Definitions
 
-### Recall@K
+### Target ID Levels & Rank Invariant
+Evaluation can be performed at three granularity levels (`--level`):
+1. **`chunk`**: Evaluates raw child chunks (`expected_chunk_ids`).
+2. **`parent`**: Evaluates expanded parent documents / pages (`expected_parent_ids`). This matches the output contract of `Retriever.retrieve()`.
+3. **`document`**: Evaluates whole source documents (`expected_document_ids`).
+
+> [!IMPORTANT]
+> **No Cross-Level ID Pollution**: If a retriever outputs documents lacking identifiers for the requested level (e.g., evaluating chunk level on a retriever that expands to parents without retaining chunk metadata), the harness assigns a non-matching placeholder (`__unidentified_<level>_<rank>__`). This preserves the document's rank slot to properly penalize Precision and MRR without falsely matching ground-truth IDs from other levels.
+
+### Deduplication Invariant
+In Information Retrieval evaluation, rank positions represent distinct documents. If a retriever returns duplicate entries (e.g., from hybrid rank fusion or multiple chunks resolving to the same parent), IDs are deduplicated preserving the rank of their *first* occurrence. This ensures strict mathematical consistency:
+$$\text{Hit@K} = 1.0 \iff \text{Recall@K} > 0.0$$
+
+### Metric Calculations
+
+#### Recall@K
 $$\text{Recall@K} = \frac{|\text{Retrieved}_{1..K} \cap \text{Relevant}|}{|\text{Relevant}|}$$
-Fraction of annotated ground-truth target IDs retrieved in the top $K$ results. Handled safely when multiple targets exist (e.g., multi-paper queries).
+Fraction of annotated ground-truth target IDs retrieved in the top $K$ unique items.
 
-### Mean Reciprocal Rank (MRR)
-$$\text{MRR} = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_i}$$
-Where $\text{rank}_i$ is the 1-indexed position of the *first* relevant document returned for query $i$. Returns $0.0$ if no relevant result is retrieved.
+#### Precision@K
+$$\text{Precision@K} = \frac{|\text{Retrieved}_{1..K} \cap \text{Relevant}|}{K}$$
+Fraction of top $K$ retrieved slots containing relevant items.
 
-### Unanswerable Query Handling
-Unanswerable queries (`is_answerable: false`) are strictly separated from Recall and MRR computations. They do not inflate retrieval performance. The harness evaluates whether out-of-domain queries are flagged, return low confidence, or cleanly trigger downstream abstention.
+#### Hit@K
+$$\text{Hit@K} = \begin{cases} 1.0 & \text{if } |\text{Retrieved}_{1..K} \cap \text{Relevant}| \ge 1 \\ 0.0 & \text{otherwise} \end{cases}$$
+
+#### Mean Reciprocal Rank (MRR / MRR@K)
+$$\text{MRR@K} = \frac{1}{|Q_{\text{ans}}|} \sum_{i=1}^{|Q_{\text{ans}}|} \text{RR}_i$$
+Where $\text{RR}_i = \frac{1}{\text{rank}_i}$ for the first relevant document found within rank $K$, and $0.0$ if no relevant document appears within the top $K$.
 
 ---
 
-## 4. Running Evaluation
+## 4. Unanswerable Query Evaluation: Retrieval vs. Generation
+
+> [!NOTE]
+> **Strict Retrieval-Only Boundary**: Retrieval evaluation and answer-generation evaluation are distinct tasks. A retrieval harness observes retrieved document IDs, not generated natural-language text.
+
+For out-of-corpus queries (`is_answerable = false`, `expected_ids = []`):
+- **Clean Abstention (Empty Retrieval / True Negative)**: The retriever returned zero documents (`len(retrieved_ids) == 0`).
+- **Retrieval False Positive**: The retriever returned documents despite no corpus document being relevant.
+
+Unanswerable queries are excluded from Recall and MRR averages to prevent metric inflation. Downstream generation abstention (the LLM refusing to answer when context is absent or insufficient) is evaluated separately in the end-to-end generation evaluation suite.
+
+---
+
+## 5. Running Evaluation
 
 ### Fast Offline Fixture Mode (CI/CD Default)
-Executes in `< 0.1` seconds without loading PyTorch weights or writing to disk:
+Executes in `< 0.05` seconds without loading PyTorch weights or writing to disk:
 ```bash
 python evaluation/evaluate.py --mode fixture
+```
+
+### Chunk-Level Fixture Evaluation
+```bash
+python evaluation/evaluate.py --mode fixture --level chunk
 ```
 
 ### Live End-to-End Retrieval Mode
@@ -71,7 +109,7 @@ Indexes the 3 sample research papers using `bge-small-en-v1.5`, BM25, and `ms-ma
 python evaluation/evaluate.py --mode live --level parent --k 5
 ```
 
-Export detailed JSON results:
+### Export Detailed JSON Results
 ```bash
-python evaluation/evaluate.py --mode fixture --output-json evaluation/results.json
+python evaluation/evaluate.py --mode fixture --output-json evaluation/benchmark_results.json
 ```
